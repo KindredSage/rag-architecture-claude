@@ -1,0 +1,108 @@
+{
+  "_comment": "Sample response for: POST /execute",
+  "_request": {
+    "query": "Give me trade details for file id 999 from My_Table",
+    "context": {
+      "user_id": "analyst_01",
+      "department": "trading_desk"
+    }
+  },
+  "answer": "Here are the trade details for **file ID 999** from `My_Table`:\n\n| Field          | Value                        |\n|----------------|------------------------------|\n| Trade ID       | TRD-20241115-0042            |\n| Trade Date     | 2024-11-15                   |\n| Instrument     | USD/EUR FX Forward           |\n| Quantity       | 1,000,000.00                 |\n| Price          | 1.0852                       |\n| Notional       | EUR 1,085,200.00             |\n| Currency       | EUR                          |\n| Counterparty   | DEUTSCHE BANK AG             |\n| Status         | ✅ SETTLED                   |\n| Created At     | 2024-11-15T09:32:11Z         |\n| Last Updated   | 2024-11-18T14:05:00Z         |\n\n**Analysis**: The trade is fully settled. Notional aligns with quantity × price (1,000,000 × 1.0852 = 1,085,200). No anomalies detected.",
+  "agent_used": "trade_agent",
+  "steps": [
+    {
+      "node": "IntentAnalyzer",
+      "action": "extracted_intent",
+      "output": "retrieve trade details"
+    },
+    {
+      "node": "AgentSelector",
+      "action": "agent_selected",
+      "output": {
+        "agent": "trade_agent",
+        "reason": "The query explicitly asks to retrieve trade data by file ID from a named table, which maps directly to the trade_agent's 'retrieve trade details by file_id' capability."
+      }
+    },
+    {
+      "node": "AgentExecutor",
+      "action": "agent_executed",
+      "output": {
+        "agent": "trade_agent",
+        "result_keys": ["answer", "steps", "confidence", "metadata"]
+      }
+    },
+    {
+      "node": "QueryAnalyst",
+      "action": "query_analyzed",
+      "output": {
+        "intent": "retrieve",
+        "table_name": "My_Table",
+        "file_id": "999",
+        "filters": {},
+        "columns_requested": ["*"],
+        "requires_join": false,
+        "summary": "Get all trade details for file_id = 999 from My_Table"
+      }
+    },
+    {
+      "node": "QueryPlanner",
+      "action": "plan_created",
+      "output": [
+        "1. Resolve table schema for My_Table",
+        "2. Build SELECT query filtered by file_id = 999",
+        "3. Validate query for safety and correctness",
+        "4. Execute query against trade data warehouse",
+        "5. Analyze returned rows for anomalies",
+        "6. Synthesize human-readable response"
+      ]
+    },
+    {
+      "node": "SchemaAnalyzer",
+      "action": "schema_fetched",
+      "output": {
+        "table": "My_Table",
+        "column_count": 12
+      }
+    },
+    {
+      "node": "QueryBuilder",
+      "action": "query_built",
+      "output": {
+        "sql": "SELECT file_id, trade_id, trade_date, instrument, quantity, price, notional, currency, counterparty, status, created_at, updated_at FROM My_Table WHERE file_id = :file_id LIMIT 1000",
+        "params": { "file_id": 999 }
+      }
+    },
+    {
+      "node": "QueryValidator",
+      "action": "query_validated",
+      "output": {
+        "errors": [],
+        "passed": true
+      }
+    },
+    {
+      "node": "QueryExecutor",
+      "action": "query_executed",
+      "output": {
+        "rows_returned": 1,
+        "execution_ms": 42
+      }
+    },
+    {
+      "node": "DetailsAnalyzer",
+      "action": "details_analyzed",
+      "output": "The trade for file 999 is a SETTLED USD/EUR FX Forward. Notional EUR 1,085,200 against counterparty Deutsche Bank AG. No anomalies detected..."
+    },
+    {
+      "node": "ResultSynthesizer",
+      "action": "answer_synthesized",
+      "output": "Trade file 999 corresponds to a settled USD/EUR FX Forward with notional EUR 1,085,200..."
+    },
+    {
+      "node": "ResponseSynthesizer",
+      "action": "response_synthesized",
+      "output": "Here are the trade details for file ID 999 from My_Table:..."
+    }
+  ],
+  "confidence": 0.95
+}
