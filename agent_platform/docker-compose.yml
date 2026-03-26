@@ -1,0 +1,139 @@
+# ==========================================================================
+#  Agent Platform - Full Stack Docker Compose
+#
+#  Profiles:
+#    default      -> app + postgres + redis (minimal, you provide CH)
+#    full         -> app + postgres + redis + clickhouse
+#    multi-server -> 3 app instances + nginx + postgres + redis + clickhouse
+#
+#  Usage:
+#    docker compose up                           # default
+#    docker compose --profile full up            # with ClickHouse
+#    docker compose --profile multi-server up    # 3 servers + load balancer
+# ==========================================================================
+
+services:
+
+  # ── PostgreSQL (Session Store) ─────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agent_platform
+      POSTGRES_USER: agent_user
+      POSTGRES_PASSWORD: agent_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_user -d agent_platform"]
+      interval: 5s
+      retries: 5
+
+  # ── Redis (Cache + Rate Limiting) ──────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  # ── ClickHouse (Analytical DB) ─────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    profiles: [full, multi-server]
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # Native
+    volumes:
+      - chdata:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      retries: 5
+
+  # ── Agent Platform (Single Instance) ───────────────────────────
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      SERVER_ID: server-main
+      AGENT_PG_HOST: postgres
+      AGENT_REDIS_URL: redis://redis:6379/0
+      AGENT_CH_HOST: clickhouse
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Multi-Server Instances (load balanced) ─────────────────────
+  app-1:
+    build: .
+    profiles: [multi-server]
+    env_file: .env
+    environment:
+      SERVER_ID: server-1
+      AGENT_PG_HOST: postgres
+      AGENT_REDIS_URL: redis://redis:6379/0
+      AGENT_CH_HOST: clickhouse
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  app-2:
+    build: .
+    profiles: [multi-server]
+    env_file: .env
+    environment:
+      SERVER_ID: server-2
+      AGENT_PG_HOST: postgres
+      AGENT_REDIS_URL: redis://redis:6379/0
+      AGENT_CH_HOST: clickhouse
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  app-3:
+    build: .
+    profiles: [multi-server]
+    env_file: .env
+    environment:
+      SERVER_ID: server-3
+      AGENT_PG_HOST: postgres
+      AGENT_REDIS_URL: redis://redis:6379/0
+      AGENT_CH_HOST: clickhouse
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Nginx Load Balancer ────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    profiles: [multi-server]
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app-1
+      - app-2
+      - app-3
+
+volumes:
+  pgdata:
+  chdata:
