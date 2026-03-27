@@ -12,6 +12,7 @@ class TradeAgentState(TypedDict):
     user_query: str
     intent_analysis: dict
     context_overrides: dict
+    conversation_history: list[dict]  # recent chat history for context
 
     # ---- Sub-agent outputs ----
     trade_context: dict         # from trade_analyst

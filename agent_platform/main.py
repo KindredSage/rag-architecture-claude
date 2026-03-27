@@ -20,6 +20,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -397,10 +398,18 @@ async def execute_query_stream(
     }
 
     async def event_generator():
-        yield _sse({"run_id": run_id, "session_id": session_id, "status": "started"})
+        yield _sse({
+            "event": "run_started",
+            "run_id": run_id,
+            "session_id": session_id,
+            "query": req.query,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
         start = time.monotonic()
         final_result = None
+        # Track cumulative timing for a running total
+        step_timings: dict[str, float] = {}
 
         try:
             async for event in request.app.state.master_graph.astream_events(
@@ -408,41 +417,206 @@ async def execute_query_stream(
             ):
                 etype = event.get("event", "")
                 name = event.get("name", "")
+                tags = event.get("tags", [])
 
-                if etype == "on_chain_start" and name not in ("__start__", ""):
-                    yield _sse({"step": name, "status": "started"})
+                # Skip internal LangGraph plumbing nodes
+                if name in ("__start__", "__end__", "", "RunnableSequence"):
+                    continue
 
-                elif etype == "on_chain_end" and name not in ("__end__", ""):
+                elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+
+                if etype == "on_chain_start":
+                    step_timings[name] = time.monotonic()
+                    yield _sse({
+                        "event": "step_started",
+                        "step": name,
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+
+                elif etype == "on_chain_end":
                     output = event.get("data", {}).get("output", {})
-                    summary = ""
+
+                    # Calculate step duration
+                    step_start = step_timings.pop(name, None)
+                    step_ms = round((time.monotonic() - step_start) * 1000, 1) if step_start else None
+
+                    # Extract rich details from execution trace
+                    details: dict[str, Any] = {
+                        "event": "step_completed",
+                        "step": name,
+                        "duration_ms": step_ms,
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+
                     if isinstance(output, dict):
                         trace = output.get("execution_trace", [])
                         if trace:
-                            summary = trace[-1].get("output_summary", "")
-                    yield _sse({"step": name, "status": "completed", "summary": summary})
+                            last = trace[-1]
+                            details["summary"] = last.get("output_summary", "")
+                            details["status"] = last.get("status", "completed")
+                            if last.get("error"):
+                                details["error"] = last["error"]
 
-                    if name == "merge_results":
-                        final_result = output
+                            # Copy node-specific timing from timed_node wrapper
+                            if last.get("started_at"):
+                                details["started_at"] = last["started_at"]
+                            if last.get("completed_at"):
+                                details["completed_at"] = last["completed_at"]
 
-            timing_ms = (time.monotonic() - start) * 1000
+                        # ── Emit node-specific rich payloads ─────────
+                        if name == "classify_intent":
+                            intent = output.get("intent_analysis", {})
+                            details["intent"] = {
+                                "domain": intent.get("primary_domain"),
+                                "intent": intent.get("intent"),
+                                "complexity": intent.get("complexity"),
+                                "desired_output": intent.get("desired_output"),
+                                "entities": intent.get("entities", [])[:5],
+                                "ambiguity": intent.get("ambiguity_notes", ""),
+                            }
+
+                        elif name == "select_agents":
+                            decision = output.get("routing_decision", {})
+                            details["routing"] = {
+                                "selected_agents": [
+                                    {"agent_id": s.get("agent_id"),
+                                     "reason": s.get("reason"),
+                                     "confidence": s.get("confidence")}
+                                    for s in decision.get("selected_agents", [])
+                                ],
+                                "strategy": decision.get("execution_strategy", "sequential"),
+                            }
+
+                        elif name == "trade_analyst":
+                            ctx = output.get("trade_context", {})
+                            details["trade_context"] = {
+                                "asset_class": ctx.get("asset_class"),
+                                "metrics": ctx.get("relevant_metrics", [])[:5],
+                                "tables": ctx.get("suggested_tables", []),
+                                "resolved_query": ctx.get("resolved_query", ""),
+                            }
+
+                        elif name == "schema_analyzer":
+                            schema = output.get("schema_info", {})
+                            tables = schema.get("tables", {})
+                            details["schema"] = {
+                                "tables_found": list(tables.keys())[:10],
+                                "total_columns": sum(len(t.get("columns", [])) for t in tables.values()),
+                            }
+
+                        elif name == "query_builder":
+                            sql = output.get("generated_sql", "")
+                            details["sql_preview"] = sql[:500]
+
+                        elif name == "query_validator":
+                            val = output.get("validation_result", {})
+                            details["validation"] = {
+                                "is_valid": val.get("is_valid"),
+                                "security_passed": val.get("security_passed"),
+                                "performance_score": val.get("performance_score"),
+                                "issue_count": len(val.get("issues", [])),
+                                "issues": [i.get("message", "") for i in val.get("issues", [])[:3]],
+                            }
+
+                        elif name == "sql_approval_gate":
+                            pending = output.get("hitl_pending", {})
+                            resp = output.get("hitl_response", {})
+                            if pending.get("status") == "pending":
+                                details["hitl"] = {
+                                    "status": "waiting",
+                                    "interrupt_id": pending.get("interrupt_id"),
+                                    "type": pending.get("type"),
+                                }
+                            elif resp:
+                                details["hitl"] = {"status": resp.get("action", "unknown")}
+
+                        elif name == "query_executor":
+                            qr = output.get("query_results", {})
+                            details["execution"] = {
+                                "success": qr.get("success"),
+                                "row_count": qr.get("row_count", 0),
+                                "clickhouse_ms": qr.get("execution_time_ms", 0),
+                                "bytes_read": qr.get("bytes_read", 0),
+                                "truncated": qr.get("truncated", False),
+                            }
+
+                        elif name == "details_analyzer":
+                            analysis = output.get("analysis", {})
+                            details["analysis"] = {
+                                "findings_count": len(analysis.get("key_findings", [])),
+                                "charts_recommended": len(analysis.get("visualization_recommendations", [])),
+                                "confidence": analysis.get("confidence", 0),
+                                "export": analysis.get("export_recommendation", "none"),
+                            }
+                            artifacts = output.get("artifacts", [])
+                            if artifacts:
+                                details["artifacts"] = [
+                                    {"type": a.get("type"), "name": a.get("name")}
+                                    for a in artifacts[:5]
+                                ]
+
+                        elif name == "merge_results":
+                            final_result = output
+                            final = output.get("final_response", {})
+                            details["final"] = {
+                                "confidence": final.get("confidence", 0),
+                                "has_data": bool(final.get("data")),
+                                "suggestions_count": len(final.get("suggestions", [])),
+                            }
+
+                    yield _sse(details)
+
+                elif etype == "on_llm_start":
+                    yield _sse({
+                        "event": "llm_call",
+                        "step": name,
+                        "status": "calling_llm",
+                        "elapsed_ms": elapsed_ms,
+                    })
+
+            timing_ms = round((time.monotonic() - start) * 1000, 1)
 
             if final_result:
                 resp = final_result.get("final_response", {})
+
+                # Check for HITL waiting
+                is_waiting = resp.get("status") == "waiting_human"
+                run_status = "waiting_human" if is_waiting else "completed"
+
                 yield _sse({
-                    "status": "completed",
+                    "event": "run_completed",
+                    "status": run_status,
                     "answer": resp.get("answer", ""),
-                    "timing_ms": round(timing_ms, 1),
+                    "confidence": resp.get("confidence", 0),
+                    "suggestions": resp.get("suggestions", []),
+                    "timing_ms": timing_ms,
+                    "interrupt": resp.get("interrupt") if is_waiting else None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
+
                 await sm.complete_run(
-                    run_id=run_id, status="completed",
+                    run_id=run_id, status=run_status,
                     result=resp, timing_ms=timing_ms,
                 )
             else:
-                yield _sse({"status": "completed", "timing_ms": round(timing_ms, 1)})
+                yield _sse({
+                    "event": "run_completed",
+                    "status": "completed",
+                    "timing_ms": timing_ms,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
 
         except Exception as e:
-            logger.error("Stream error: %s", e)
-            yield _sse({"status": "error", "error": str(e)})
+            logger.error("Stream error: %s", e, exc_info=True)
+            yield _sse({
+                "event": "run_error",
+                "status": "error",
+                "error": str(e),
+                "elapsed_ms": round((time.monotonic() - start) * 1000, 1),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
             await sm.complete_run(run_id=run_id, status="failed", error=str(e))
 
     return StreamingResponse(

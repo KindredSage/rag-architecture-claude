@@ -72,6 +72,12 @@ class MasterState(TypedDict):
 
 INTENT_CLASSIFIER_PROMPT = """You are an intent classifier for a multi-agent analytical data platform backed by ClickHouse.
 
+CRITICAL: The user may be continuing a conversation. Use the conversation history to resolve:
+- Pronouns: "it", "them", "those" -> the entity from the previous exchange
+- Implicit subjects: "What are the downstreams?" -> "downstreams of [entity from history]"
+- Relative references: "the same desk", "that ticker", "last month's" 
+- Follow-ups: "now show me a chart" -> chart of the data from the previous query
+
 Analyze the user query and return ONLY a valid JSON object (no markdown fences, no explanation) with this exact structure:
 {{
   "primary_domain": "<trade|analytics|reporting|general>",
@@ -83,7 +89,8 @@ Analyze the user query and return ONLY a valid JSON object (no markdown fences, 
   "sub_intents": ["<if multi-agent, list each sub-intent>"],
   "time_range": "<extracted time range or null>",
   "filters": {{"<any explicit filters mentioned>": "<value>"}},
-  "ambiguity_notes": "<anything unclear that might need clarification>"
+  "ambiguity_notes": "<anything unclear that might need clarification>",
+  "resolved_entities": ["<entities resolved from conversation context, e.g. 'System A' from previous exchange>"]
 }}
 
 Available agents and their capabilities:
@@ -91,7 +98,7 @@ Available agents and their capabilities:
 
 User Query: {user_query}
 
-Conversation history (last few exchanges, if any):
+Conversation history (use this to resolve references):
 {history_context}
 """
 
@@ -392,6 +399,7 @@ async def execute_agents(state: MasterState, *, services, settings, **kwargs) ->
                     "run_id": state.get("user_context", {}).get("run_id", ""),
                     "session_id": state.get("user_context", {}).get("session_id", ""),
                 },
+                "conversation_history": state.get("user_context", {}).get("history", []),
                 "hitl_config": state.get("user_context", {}).get("hitl_config", {}),
                 "hitl_pending": {},
                 "hitl_response": {},

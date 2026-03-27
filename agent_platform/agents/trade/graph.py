@@ -80,6 +80,7 @@ def build_trade_agent_graph(*, settings, services) -> Any:
     from tools.plotting_tools import create_plotting_tools
     from tools.export_tools import create_export_tools
     from tools.email_tools import create_email_tools
+    from agents.node_runner import timed_node
 
     llm_service: LLMService = services["llm"]
     llm_primary = llm_service.get_model(fast=False)
@@ -93,30 +94,30 @@ def build_trade_agent_graph(*, settings, services) -> Any:
     exp_tools = create_export_tools(settings.artifact_dir)
     mail_tools = create_email_tools(settings)
 
-    # ── Bound node functions ─────────────────────────────────────
+    # ── Raw node functions ────────────────────────────────────────
 
-    async def _trade_analyst(state: TradeAgentState) -> dict:
+    async def _trade_analyst_raw(state: TradeAgentState) -> dict:
         return await trade_analyst(state, llm=llm_fast)
 
-    async def _query_analyst(state: TradeAgentState) -> dict:
+    async def _query_analyst_raw(state: TradeAgentState) -> dict:
         return await query_analyst(state, llm=llm_fast)
 
-    async def _query_planner(state: TradeAgentState) -> dict:
+    async def _query_planner_raw(state: TradeAgentState) -> dict:
         return await query_planner(state, llm=llm_fast)
 
-    async def _schema_analyzer(state: TradeAgentState) -> dict:
+    async def _schema_analyzer_raw(state: TradeAgentState) -> dict:
         return await schema_analyzer(state, ch_service=ch, cache_service=cache)
 
-    async def _query_builder(state: TradeAgentState) -> dict:
+    async def _query_builder_raw(state: TradeAgentState) -> dict:
         return await query_builder(state, llm=llm_primary, settings=settings)
 
-    async def _query_validator(state: TradeAgentState) -> dict:
+    async def _query_validator_raw(state: TradeAgentState) -> dict:
         return await query_validator(state, llm=llm_fast, settings=settings)
 
-    async def _query_executor(state: TradeAgentState) -> dict:
+    async def _query_executor_raw(state: TradeAgentState) -> dict:
         return await query_executor(state, ch_service=ch, cache_service=cache)
 
-    async def _details_analyzer(state: TradeAgentState) -> dict:
+    async def _details_analyzer_raw(state: TradeAgentState) -> dict:
         return await details_analyzer(
             state,
             llm=llm_primary,
@@ -124,6 +125,16 @@ def build_trade_agent_graph(*, settings, services) -> Any:
             export_tools=exp_tools,
             email_tools=mail_tools,
         )
+
+    # ── Wrap all nodes with timed_node for consistent timing ─────
+    _trade_analyst_n = timed_node("trade_analyst", "trade_agent", _trade_analyst_raw)
+    _query_analyst_n = timed_node("query_analyst", "trade_agent", _query_analyst_raw)
+    _query_planner_n = timed_node("query_planner", "trade_agent", _query_planner_raw)
+    _schema_analyzer_n = timed_node("schema_analyzer", "trade_agent", _schema_analyzer_raw)
+    _query_builder_n = timed_node("query_builder", "trade_agent", _query_builder_raw)
+    _query_validator_n = timed_node("query_validator", "trade_agent", _query_validator_raw)
+    _query_executor_n = timed_node("query_executor", "trade_agent", _query_executor_raw)
+    _details_analyzer_n = timed_node("details_analyzer", "trade_agent", _details_analyzer_raw)
 
     # ── HITL Gate Nodes ──────────────────────────────────────────
 
@@ -200,16 +211,16 @@ def build_trade_agent_graph(*, settings, services) -> Any:
 
     graph = StateGraph(TradeAgentState)
 
-    graph.add_node("trade_analyst", _trade_analyst)
+    graph.add_node("trade_analyst", _trade_analyst_n)
     graph.add_node("clarification_gate", _clarification_gate)
-    graph.add_node("query_analyst", _query_analyst)
-    graph.add_node("query_planner", _query_planner)
-    graph.add_node("schema_analyzer", _schema_analyzer)
-    graph.add_node("query_builder", _query_builder)
-    graph.add_node("query_validator", _query_validator)
+    graph.add_node("query_analyst", _query_analyst_n)
+    graph.add_node("query_planner", _query_planner_n)
+    graph.add_node("schema_analyzer", _schema_analyzer_n)
+    graph.add_node("query_builder", _query_builder_n)
+    graph.add_node("query_validator", _query_validator_n)
     graph.add_node("sql_approval_gate", _sql_approval_gate)
-    graph.add_node("query_executor", _query_executor)
-    graph.add_node("details_analyzer", _details_analyzer)
+    graph.add_node("query_executor", _query_executor_n)
+    graph.add_node("details_analyzer", _details_analyzer_n)
 
     # Flow with HITL gates inserted
     graph.add_edge(START, "trade_analyst")

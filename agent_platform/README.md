@@ -188,18 +188,75 @@ Response:
 
 ### POST /execute/stream
 
-Same input as /execute but returns SSE events:
+Same input as /execute but returns rich SSE events with per-step timing, routing decisions, SQL previews, and node-specific payloads:
 
 ```
-data: {"run_id": "uuid", "session_id": "uuid", "status": "started"}
-data: {"step": "classify_intent", "status": "started"}
-data: {"step": "classify_intent", "status": "completed", "summary": "domain=trade, intent=query_data"}
-data: {"step": "select_agents", "status": "started"}
-data: {"step": "select_agents", "status": "completed", "summary": "Selected: [trade_agent]"}
-data: {"step": "trade_analyst", "status": "started"}
-...
-data: {"status": "completed", "answer": "Desk Alpha leads...", "timing_ms": 3450.5}
+data: {"event":"run_started","run_id":"abc-123","session_id":"sess-456","query":"PnL by desk last month","timestamp":"..."}
+
+data: {"event":"step_started","step":"classify_intent","elapsed_ms":2.1}
+data: {"event":"step_completed","step":"classify_intent","duration_ms":423.5,"elapsed_ms":425.6,
+       "intent":{"domain":"trade","intent":"query_data","complexity":"simple","desired_output":"table","entities":["PnL","desk"]}}
+
+data: {"event":"step_started","step":"select_agents","elapsed_ms":426.0}
+data: {"event":"step_completed","step":"select_agents","duration_ms":312.1,"elapsed_ms":738.1,
+       "routing":{"selected_agents":[{"agent_id":"trade_agent","reason":"PnL query matches trade domain","confidence":0.95}],"strategy":"sequential"}}
+
+data: {"event":"step_started","step":"trade_analyst","elapsed_ms":739.0}
+data: {"event":"llm_call","step":"trade_analyst","status":"calling_llm","elapsed_ms":740.5}
+data: {"event":"step_completed","step":"trade_analyst","duration_ms":502.3,"elapsed_ms":1241.3,
+       "trade_context":{"asset_class":"equities","metrics":["PnL","volume"],"tables":["trades"],"resolved_query":"Show PnL by desk for last month"}}
+
+data: {"event":"step_started","step":"query_builder","elapsed_ms":1845.0}
+data: {"event":"step_completed","step":"query_builder","duration_ms":890.2,"elapsed_ms":2735.2,
+       "sql_preview":"SELECT desk, SUM(pnl) AS total_pnl FROM trades PREWHERE trade_date >= today() - 30 GROUP BY desk ORDER BY total_pnl DESC LIMIT 100"}
+
+data: {"event":"step_started","step":"query_validator","elapsed_ms":2736.0}
+data: {"event":"step_completed","step":"query_validator","duration_ms":280.1,"elapsed_ms":3016.1,
+       "validation":{"is_valid":true,"security_passed":true,"performance_score":9,"issue_count":0}}
+
+data: {"event":"step_started","step":"query_executor","elapsed_ms":3017.0}
+data: {"event":"step_completed","step":"query_executor","duration_ms":67.3,"elapsed_ms":3084.3,
+       "execution":{"success":true,"row_count":12,"clickhouse_ms":45.2,"bytes_read":1024000,"truncated":false}}
+
+data: {"event":"step_started","step":"details_analyzer","elapsed_ms":3085.0}
+data: {"event":"step_completed","step":"details_analyzer","duration_ms":620.5,"elapsed_ms":3705.5,
+       "analysis":{"findings_count":3,"charts_recommended":1,"confidence":0.92,"export":"none"},
+       "artifacts":[{"type":"chart_html","name":"PnL by Desk.html"}]}
+
+data: {"event":"run_completed","status":"completed","answer":"Desk Alpha leads with $2.3M PnL...","confidence":0.92,
+       "suggestions":["Break down by ticker?","Compare to previous month?"],"timing_ms":3850.5}
 ```
+
+Every event includes `elapsed_ms` (wall-clock since run start) and step events include `duration_ms` (that node's execution time). Node-specific payloads give visibility into what each step decided, generated, or found.
+
+### Conversation Continuity (Follow-Up Queries)
+
+The platform maintains conversation history per session via PostgreSQL. When a user sends a follow-up query, the history is injected into every LLM prompt so agents can resolve references:
+
+```bash
+# Turn 1: Ask about upstreams
+curl -X POST http://localhost:8000/execute -d '{
+  "query": "What are the upstreams of System A?",
+  "session_id": null
+}'
+# Response: {"session_id": "sess-456", "answer": "System A has upstreams: X, Y, Z"}
+
+# Turn 2: Follow up with pronoun reference (same session_id)
+curl -X POST http://localhost:8000/execute -d '{
+  "query": "What are the downstreams?",
+  "session_id": "sess-456"
+}'
+# The system resolves "the downstreams" -> "downstreams of System A" from history
+# Response: {"answer": "System A has downstreams: P, Q, R"}
+```
+
+How it works internally:
+1. Each message (user query + assistant response) is stored in `agent_messages` table per session
+2. On each new request, the last 10 messages are loaded as `conversation_history`
+3. The **master agent's intent classifier** sees the history and resolves references
+4. The **trade_analyst** node produces a `resolved_query` field with pronouns expanded
+5. The **query_analyst** uses `resolved_query` as primary input, not the raw user query
+6. This chain ensures "What are the downstreams?" becomes `SELECT ... WHERE system_name = 'System A' AND relationship_type = 'downstream' ...`
 
 ### GET /execute/{run_id}
 
