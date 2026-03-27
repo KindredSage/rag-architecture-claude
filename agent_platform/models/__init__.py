@@ -33,6 +33,7 @@ class RunStatus(str, Enum):
     PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    WAITING_HUMAN = "waiting_human"  # paused for human-in-the-loop
 
 
 class ExecutionStrategy(str, Enum):
@@ -204,3 +205,85 @@ class QueryExecutionResult(BaseModel):
     bytes_read: int = 0
     truncated: bool = False
     error: str | None = None
+
+
+# ── Human-in-the-Loop Models ────────────────────────────────────
+
+
+class InterruptType(str, Enum):
+    """Types of human intervention points."""
+    APPROVAL = "approval"           # approve/reject before proceeding
+    CLARIFICATION = "clarification" # agent needs more info from user
+    MODIFICATION = "modification"   # user can edit generated content (e.g. SQL)
+    CONFIRMATION = "confirmation"   # confirm before irreversible action (email)
+    REVIEW = "review"               # review results before finalizing
+
+
+class InterruptStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    MODIFIED = "modified"
+    CLARIFIED = "clarified"
+    EXPIRED = "expired"
+    AUTO_APPROVED = "auto_approved"
+
+
+class InterruptRequest(BaseModel):
+    """Created by an agent node when it needs human input."""
+    interrupt_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    run_id: str
+    session_id: str
+    interrupt_type: InterruptType
+    node_name: str                  # which node paused
+    agent_id: str                   # which agent
+    title: str                      # human-readable title
+    description: str                # what the agent is asking
+    payload: dict[str, Any] = Field(default_factory=dict)
+    # payload examples:
+    #   APPROVAL:      {"sql": "SELECT ...", "estimated_rows": 50000}
+    #   CLARIFICATION: {"question": "Which desk?", "options": ["Alpha", "Beta"]}
+    #   MODIFICATION:  {"sql": "SELECT ...", "editable_fields": ["sql"]}
+    #   CONFIRMATION:  {"action": "send_email", "to": ["a@b.com"], "subject": "..."}
+    auto_approve_seconds: int | None = None  # auto-approve after N seconds (None = wait forever)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class InterruptResponse(BaseModel):
+    """Submitted by the user to resolve an interrupt."""
+    interrupt_id: str
+    action: InterruptStatus         # approved / rejected / modified / clarified
+    modifications: dict[str, Any] = Field(default_factory=dict)
+    # modifications examples:
+    #   MODIFIED:  {"sql": "SELECT desk, SUM(pnl) ... LIMIT 50"}
+    #   CLARIFIED: {"answer": "Alpha desk only"}
+    comment: str = ""               # optional user comment
+
+
+class InterruptInfo(BaseModel):
+    """API response model for interrupt details."""
+    interrupt_id: str
+    run_id: str
+    session_id: str
+    interrupt_type: InterruptType
+    status: InterruptStatus
+    node_name: str
+    agent_id: str
+    title: str
+    description: str
+    payload: dict[str, Any]
+    auto_approve_seconds: int | None
+    created_at: datetime
+    resolved_at: datetime | None = None
+    resolution: dict[str, Any] | None = None
+
+
+class HITLConfig(BaseModel):
+    """Per-request HITL configuration. Passed in ExecuteRequest.preferences."""
+    enabled: bool = False
+    require_sql_approval: bool = True       # pause before executing SQL
+    require_email_confirmation: bool = True  # pause before sending email
+    require_export_confirmation: bool = False # pause before generating exports
+    auto_approve_timeout: int | None = None  # seconds, None = wait forever
+    # Complexity threshold: only interrupt if query complexity >= this level
+    complexity_threshold: str = "simple"     # simple | moderate | complex

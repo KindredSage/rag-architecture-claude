@@ -378,6 +378,81 @@ AGENT_MCP_SERVER_URLS=["http://localhost:8081/mcp"]
 
 ---
 
+## Human-in-the-Loop (HITL)
+
+The platform supports pausing agent execution at critical points and waiting for human approval, modification, or clarification before proceeding.
+
+### Enabling HITL
+
+Pass HITL configuration in the `preferences` field of your request:
+
+```bash
+curl -X POST http://localhost:8000/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Show me PnL by desk for last month",
+    "preferences": {
+      "hitl": {
+        "enabled": true,
+        "require_sql_approval": true,
+        "require_email_confirmation": true,
+        "require_export_confirmation": false,
+        "auto_approve_timeout": null,
+        "complexity_threshold": "simple"
+      }
+    }
+  }'
+```
+
+### HITL Flow
+
+When HITL is enabled and an interrupt is triggered:
+
+1. The response returns with `status: "waiting_human"` and an `interrupt_id`
+2. You inspect the interrupt: `GET /interrupts/{interrupt_id}`
+3. You resolve it: `POST /interrupts/{interrupt_id}/resolve`
+4. The pipeline continues (or stops if rejected)
+
+### Interrupt Types
+
+| Type | Where | What Happens |
+|------|-------|-------------|
+| `approval` | Before SQL execution | Shows generated SQL. Approve, modify, or reject. |
+| `confirmation` | Before sending email | Shows recipients and attachments. Confirm or cancel. |
+| `clarification` | After intent classification | Agent asks user to clarify ambiguous query. |
+| `modification` | Before SQL execution | User can directly edit the SQL before it runs. |
+| `review` | Before export generation | Review report structure before generating. |
+
+### Resolution Actions
+
+```bash
+# Approve
+POST /interrupts/{id}/resolve
+{"action": "approved"}
+
+# Reject (stops the pipeline)
+POST /interrupts/{id}/resolve
+{"action": "rejected", "comment": "Wrong table"}
+
+# Modify SQL
+POST /interrupts/{id}/resolve
+{"action": "modified", "modifications": {"sql": "SELECT ... LIMIT 10"}}
+
+# Clarify
+POST /interrupts/{id}/resolve
+{"action": "clarified", "modifications": {"answer": "Only desk Alpha"}}
+```
+
+### Auto-Approve Timeout
+
+Set `auto_approve_timeout` (seconds) to auto-approve if the user doesn't respond in time. Set to `null` to wait indefinitely. Clarification interrupts never auto-approve.
+
+### Complexity Threshold
+
+Set `complexity_threshold` to only trigger HITL for queries above a certain complexity level. Options: `simple` (always), `moderate`, `complex`. This is determined by the intent classifier.
+
+---
+
 ## Security Model
 
 ### Defense-in-Depth for SQL Safety

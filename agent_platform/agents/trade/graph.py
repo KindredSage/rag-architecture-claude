@@ -71,6 +71,10 @@ def build_trade_agent_graph(*, settings, services) -> Any:
 
     Dependencies (settings, services) are captured in closures so each
     node receives the right injected service.
+
+    HITL gates:
+      - clarification_gate:  after classify_intent (if ambiguous)
+      - sql_approval_gate:   after query_validator (before execution)
     """
     from services.llm_service import LLMService
     from tools.plotting_tools import create_plotting_tools
@@ -82,6 +86,7 @@ def build_trade_agent_graph(*, settings, services) -> Any:
     llm_fast = llm_service.get_model(fast=True)
     ch = services["clickhouse"]
     cache = services.get("cache")
+    hitl_svc = services.get("hitl")  # may be None if not initialized
 
     # Build tool instances
     plot_tools = create_plotting_tools(settings.artifact_dir)
@@ -120,35 +125,120 @@ def build_trade_agent_graph(*, settings, services) -> Any:
             email_tools=mail_tools,
         )
 
+    # ── HITL Gate Nodes ──────────────────────────────────────────
+
+    async def _clarification_gate(state: TradeAgentState) -> dict:
+        """Check if intent is ambiguous and ask user to clarify."""
+        from agents.hitl_gates import clarification_gate
+
+        intent = state.get("intent_analysis", {})
+        ambiguity = intent.get("ambiguity_notes", "")
+
+        if not ambiguity or not hitl_svc:
+            return {
+                "hitl_skipped": True,
+                "execution_trace": [{
+                    "node": "clarification_gate",
+                    "status": "skipped",
+                    "timestamp": __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    ).isoformat(),
+                    "output_summary": "No ambiguity detected or HITL unavailable",
+                }],
+            }
+
+        return await clarification_gate(
+            state,
+            hitl_service=hitl_svc,
+            run_id=state.get("context_overrides", {}).get("run_id", ""),
+            session_id=state.get("context_overrides", {}).get("session_id", ""),
+            agent_id="trade_agent",
+            question=ambiguity,
+        )
+
+    async def _sql_approval_gate(state: TradeAgentState) -> dict:
+        """HITL gate: pause for SQL approval before execution."""
+        from agents.hitl_gates import sql_approval_gate
+
+        if not hitl_svc:
+            return {
+                "hitl_skipped": True,
+                "execution_trace": [{
+                    "node": "sql_approval_gate",
+                    "status": "skipped",
+                    "timestamp": __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    ).isoformat(),
+                    "output_summary": "HITL service not available",
+                }],
+            }
+
+        return await sql_approval_gate(
+            state,
+            hitl_service=hitl_svc,
+            run_id=state.get("context_overrides", {}).get("run_id", ""),
+            session_id=state.get("context_overrides", {}).get("session_id", ""),
+            agent_id="trade_agent",
+        )
+
+    def _should_proceed_after_hitl(state: TradeAgentState) -> str:
+        """After HITL gate: proceed to executor or stop."""
+        hitl_resp = state.get("hitl_response", {})
+        action = hitl_resp.get("action", "")
+
+        if action in ("rejected", "expired"):
+            return "details_analyzer"  # skip execution, go to analysis
+
+        pending = state.get("hitl_pending", {})
+        if pending.get("status") == "pending":
+            return "__end__"  # graph pauses, will resume later
+
+        # Approved, modified, or HITL skipped
+        return "query_executor"
+
     # ── Graph Assembly ───────────────────────────────────────────
 
     graph = StateGraph(TradeAgentState)
 
     graph.add_node("trade_analyst", _trade_analyst)
+    graph.add_node("clarification_gate", _clarification_gate)
     graph.add_node("query_analyst", _query_analyst)
     graph.add_node("query_planner", _query_planner)
     graph.add_node("schema_analyzer", _schema_analyzer)
     graph.add_node("query_builder", _query_builder)
     graph.add_node("query_validator", _query_validator)
+    graph.add_node("sql_approval_gate", _sql_approval_gate)
     graph.add_node("query_executor", _query_executor)
     graph.add_node("details_analyzer", _details_analyzer)
 
-    # Linear flow
+    # Flow with HITL gates inserted
     graph.add_edge(START, "trade_analyst")
-    graph.add_edge("trade_analyst", "query_analyst")
+    graph.add_edge("trade_analyst", "clarification_gate")
+    graph.add_edge("clarification_gate", "query_analyst")
     graph.add_edge("query_analyst", "query_planner")
     graph.add_edge("query_planner", "schema_analyzer")
     graph.add_edge("schema_analyzer", "query_builder")
     graph.add_edge("query_builder", "query_validator")
 
-    # Conditional: retry loop or proceed
+    # Conditional: retry loop or proceed to HITL gate
     graph.add_conditional_edges(
         "query_validator",
         _should_retry_or_execute,
         {
             "query_builder": "query_builder",
+            "query_executor": "sql_approval_gate",  # HITL gate before execution
+            "details_analyzer": "details_analyzer",
+        },
+    )
+
+    # After HITL gate: proceed, pause, or stop
+    graph.add_conditional_edges(
+        "sql_approval_gate",
+        _should_proceed_after_hitl,
+        {
             "query_executor": "query_executor",
             "details_analyzer": "details_analyzer",
+            "__end__": END,  # paused for human input
         },
     )
 
@@ -165,5 +255,5 @@ def build_trade_agent_graph(*, settings, services) -> Any:
     graph.add_edge("details_analyzer", END)
 
     compiled = graph.compile()
-    logger.info("Trade Agent graph compiled successfully")
+    logger.info("Trade Agent graph compiled (with HITL gates)")
     return compiled

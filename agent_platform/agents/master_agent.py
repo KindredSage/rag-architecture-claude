@@ -387,7 +387,15 @@ async def execute_agents(state: MasterState, *, services, settings, **kwargs) ->
             agent_input = {
                 "user_query": state["user_query"],
                 "intent_analysis": state.get("intent_analysis", {}),
-                "context_overrides": overrides,
+                "context_overrides": {
+                    **overrides,
+                    "run_id": state.get("user_context", {}).get("run_id", ""),
+                    "session_id": state.get("user_context", {}).get("session_id", ""),
+                },
+                "hitl_config": state.get("user_context", {}).get("hitl_config", {}),
+                "hitl_pending": {},
+                "hitl_response": {},
+                "hitl_skipped": True,
                 "execution_trace": [],
                 "needs_retry": False,
                 "retry_count": 0,
@@ -429,28 +437,75 @@ async def execute_agents(state: MasterState, *, services, settings, **kwargs) ->
 
     # Collect artifacts from all agents
     all_artifacts = []
+    hitl_waiting = False
+    hitl_interrupt = None
     for agent_id, result in results.items():
         all_artifacts.extend(result.get("artifacts", []))
+        # Check if any agent paused for HITL
+        pending = result.get("hitl_pending", {})
+        if pending.get("status") == "pending":
+            hitl_waiting = True
+            hitl_interrupt = pending
 
-    return {
+    output = {
         "agent_results": results,
         "artifacts": all_artifacts,
         "execution_trace": sub_traces + [
             {
                 "node": "execute_agents",
-                "status": "completed",
+                "status": "waiting_human" if hitl_waiting else "completed",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "duration_ms": round(duration, 1),
-                "output_summary": f"Executed {len(results)} agents",
+                "output_summary": (
+                    f"Waiting for human input (interrupt={hitl_interrupt})"
+                    if hitl_waiting
+                    else f"Executed {len(results)} agents"
+                ),
             }
         ],
     }
+
+    if hitl_waiting:
+        output["error"] = "waiting_human"
+
+    return output
 
 
 async def merge_results(state: MasterState, *, llm, **kwargs) -> dict:
     """Merge results from all sub-agents into a unified response."""
     start = time.perf_counter()
     results = state.get("agent_results", {})
+
+    # ── HITL: if any agent is waiting, return waiting status ──────
+    if state.get("error") == "waiting_human":
+        # Find the interrupt info
+        hitl_info = {}
+        for agent_id, result in results.items():
+            pending = result.get("hitl_pending", {})
+            if pending.get("status") == "pending":
+                hitl_info = pending
+                break
+
+        return {
+            "final_response": {
+                "answer": "Waiting for your input before proceeding.",
+                "status": "waiting_human",
+                "interrupt": hitl_info,
+                "suggestions": [
+                    "Review the pending interrupt and approve, modify, or reject.",
+                    f"Use GET /interrupts/{hitl_info.get('interrupt_id', '')} for details.",
+                    f"Use POST /interrupts/{hitl_info.get('interrupt_id', '')}/resolve to respond.",
+                ],
+                "confidence": 0.0,
+                "execution_summary": "Paused for human-in-the-loop input.",
+            },
+            "execution_trace": [{
+                "node": "merge_results",
+                "status": "waiting_human",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "output_summary": f"HITL pending: {hitl_info.get('interrupt_id', '')}",
+            }],
+        }
 
     # If only one agent and it produced a clean analysis, use it directly
     if len(results) == 1:

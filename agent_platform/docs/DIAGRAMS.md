@@ -119,3 +119,80 @@ flowchart TD
     style L3 fill:#4CAF50,color:#fff
     style BLOCK1 fill:#B71C1C,color:#fff
 ```
+
+## Human-in-the-Loop: Trade Agent Flow
+
+```mermaid
+flowchart TD
+    START([Start]) --> TA[trade_analyst]
+    TA --> CG{clarification_gate}
+    CG -->|no ambiguity| QA[query_analyst]
+    CG -->|ambiguous| WAIT_CLARIFY[WAIT: User Clarifies]
+    WAIT_CLARIFY -->|user responds| QA
+
+    QA --> QP[query_planner]
+    QP --> SA[schema_analyzer]
+    SA --> QB[query_builder]
+    QB --> QV[query_validator]
+    QV -->|valid| HITL{sql_approval_gate}
+    QV -->|invalid, retry| QB
+
+    HITL -->|HITL disabled| QE[query_executor]
+    HITL -->|HITL enabled| WAIT_SQL[WAIT: User Reviews SQL]
+    WAIT_SQL -->|approved| QE
+    WAIT_SQL -->|modified| QE
+    WAIT_SQL -->|rejected| DA_SKIP[details_analyzer: skip execution]
+
+    QE --> DA[details_analyzer]
+    DA --> END_NODE([Return to Master])
+    DA_SKIP --> END_NODE
+
+    style CG fill:#FF9800,color:#fff
+    style HITL fill:#FF9800,color:#fff
+    style WAIT_CLARIFY fill:#E91E63,color:#fff
+    style WAIT_SQL fill:#E91E63,color:#fff
+```
+
+## Human-in-the-Loop: API Interaction Sequence
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as FastAPI
+    participant MA as Master Agent
+    participant TA as Trade Agent
+    participant HITL as HITL Service
+    participant PG as PostgreSQL
+
+    U->>API: POST /execute (hitl.enabled=true)
+    API->>MA: invoke master graph
+    MA->>TA: invoke trade agent
+    TA->>TA: trade_analyst -> query_builder -> validator
+
+    Note over TA,HITL: SQL validated, HITL gate triggered
+    TA->>HITL: create_interrupt(SQL approval)
+    HITL->>PG: INSERT agent_interrupts (status=pending)
+    HITL->>PG: UPDATE agent_runs SET status=waiting_human
+
+    TA-->>MA: return {hitl_pending: {interrupt_id}}
+    MA-->>API: return {status: waiting_human, interrupt}
+    API-->>U: 200 {status: "waiting_human", interrupt_id: "int-123"}
+
+    Note over U: User reviews the SQL
+    U->>API: GET /interrupts/int-123
+    API-->>U: {sql: "SELECT ...", type: "approval"}
+
+    U->>API: POST /interrupts/int-123/resolve {action: "approved"}
+    API->>HITL: resolve_interrupt(approved)
+    HITL->>PG: UPDATE status=approved
+
+    Note over U: User re-runs or graph resumes
+    U->>API: POST /execute (same session, query continues)
+    API->>MA: invoke (with approval in context)
+    MA->>TA: execute query (approved SQL)
+    TA->>TA: query_executor -> details_analyzer
+    TA-->>MA: return results
+    MA-->>API: return {status: completed, answer: "..."}
+    API-->>U: 200 {answer: "Desk Alpha leads..."}
+```
+

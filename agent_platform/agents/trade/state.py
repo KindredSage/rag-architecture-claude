@@ -31,3 +31,9 @@ class TradeAgentState(TypedDict):
     retry_count: int
     retry_feedback: str         # error message fed back to query_builder
     error: str | None
+
+    # ---- Human-in-the-Loop ----
+    hitl_config: dict           # HITLConfig as dict
+    hitl_pending: dict          # current pending interrupt (if any)
+    hitl_response: dict         # user's resolution
+    hitl_skipped: bool          # True if HITL is disabled or auto-approved

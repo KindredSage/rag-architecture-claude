@@ -107,12 +107,20 @@ async def lifespan(app: FastAPI):
             ch_tools = mcp_ch
             logger.info("Using MCP ClickHouse tools (%d tools)", len(mcp_ch))
 
+    # ── HITL Service ────────────────────────────────────────────
+    from services.hitl import HITLService
+
+    hitl_svc = HITLService(sm.pool)
+    await hitl_svc.ensure_tables()
+    logger.info("HITL service initialized")
+
     # ── Service registry ─────────────────────────────────────────
     services: dict[str, Any] = {
         "clickhouse": ch,
         "llm": llm,
         "cache": cache,
         "session_manager": sm,
+        "hitl": hitl_svc,
         "mcp": mcp,
         "ch_tools": ch_tools,
         "plotting_tools": plotting_tools,
@@ -267,6 +275,9 @@ async def execute_query(
 
     start = time.monotonic()
 
+    # Extract HITL config from preferences
+    hitl_config = req.preferences.get("hitl", {})
+
     input_state = {
         "user_query": req.query,
         "user_context": {
@@ -275,6 +286,8 @@ async def execute_query(
             "forced_agent": req.agent_id,
             "history": history,
             "session_id": session_id,
+            "run_id": run_id,
+            "hitl_config": hitl_config,
         },
         "agent_results": {},
         "execution_trace": [],
@@ -291,7 +304,15 @@ async def execute_query(
         timing_ms = (time.monotonic() - start) * 1000
         final = result.get("final_response", {})
         error = result.get("error")
-        status = RunStatus.COMPLETED if not error else RunStatus.PARTIAL
+
+        # Determine status
+        if error == "waiting_human":
+            status = RunStatus.WAITING_HUMAN
+            error = None  # Not a real error
+        elif error:
+            status = RunStatus.PARTIAL
+        else:
+            status = RunStatus.COMPLETED
 
         # Persist
         await sm.complete_run(
@@ -496,6 +517,123 @@ async def close_session(
     sm = request.app.state.services["session_manager"]
     await sm.close_session(session_id)
     return {"status": "closed", "session_id": session_id}
+
+
+# ── Human-in-the-Loop Endpoints ──────────────────────────────────
+
+from models import InterruptInfo, InterruptResponse, InterruptStatus  # noqa: E402
+
+
+@app.get("/interrupts/run/{run_id}")
+async def get_interrupts_for_run(
+    run_id: str,
+    request: Request,
+    _: Any = Depends(verify_api_key),
+):
+    """List all pending interrupts for a run."""
+    hitl_svc = request.app.state.services.get("hitl")
+    if not hitl_svc:
+        raise HTTPException(status_code=501, detail="HITL not enabled")
+
+    pending = await hitl_svc.get_pending_for_run(run_id)
+    return {"run_id": run_id, "pending_count": len(pending), "interrupts": pending}
+
+
+@app.get("/interrupts/session/{session_id}")
+async def get_interrupts_for_session(
+    session_id: str,
+    request: Request,
+    _: Any = Depends(verify_api_key),
+):
+    """List all pending interrupts for a session."""
+    hitl_svc = request.app.state.services.get("hitl")
+    if not hitl_svc:
+        raise HTTPException(status_code=501, detail="HITL not enabled")
+
+    pending = await hitl_svc.get_pending_for_session(session_id)
+    return {"session_id": session_id, "pending_count": len(pending), "interrupts": pending}
+
+
+@app.get("/interrupts/{interrupt_id}")
+async def get_interrupt_details(
+    interrupt_id: str,
+    request: Request,
+    _: Any = Depends(verify_api_key),
+):
+    """Get details of a specific interrupt."""
+    hitl_svc = request.app.state.services.get("hitl")
+    if not hitl_svc:
+        raise HTTPException(status_code=501, detail="HITL not enabled")
+
+    info = await hitl_svc.get_interrupt(interrupt_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="Interrupt not found")
+    return info
+
+
+@app.post("/interrupts/{interrupt_id}/resolve")
+async def resolve_interrupt(
+    interrupt_id: str,
+    body: dict,
+    request: Request,
+    _: Any = Depends(verify_api_key),
+):
+    """
+    Resolve a pending interrupt with the user's decision.
+
+    Body examples:
+
+    Approve:
+      {"action": "approved"}
+
+    Reject:
+      {"action": "rejected", "comment": "Query looks wrong"}
+
+    Modify SQL:
+      {"action": "modified", "modifications": {"sql": "SELECT ... LIMIT 10"}}
+
+    Clarify:
+      {"action": "clarified", "modifications": {"answer": "Only desk Alpha"}}
+    """
+    hitl_svc = request.app.state.services.get("hitl")
+    if not hitl_svc:
+        raise HTTPException(status_code=501, detail="HITL not enabled")
+
+    try:
+        response = InterruptResponse(
+            interrupt_id=interrupt_id,
+            action=InterruptStatus(body.get("action", "approved")),
+            modifications=body.get("modifications", {}),
+            comment=body.get("comment", ""),
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid action. Valid: approved, rejected, modified, clarified. Error: {e}",
+        )
+
+    result = await hitl_svc.resolve_interrupt(response)
+    if not result:
+        raise HTTPException(status_code=404, detail="Interrupt not found")
+
+    return {
+        "status": "resolved",
+        "interrupt": result,
+        "next_steps": _hitl_next_steps(result),
+    }
+
+
+def _hitl_next_steps(info: InterruptInfo) -> str:
+    """Provide guidance on what happens next after resolution."""
+    if info.status == InterruptStatus.APPROVED:
+        return "The query will now execute. Poll GET /execute/{run_id} for results."
+    elif info.status == InterruptStatus.REJECTED:
+        return "The run has been cancelled. No query was executed."
+    elif info.status == InterruptStatus.MODIFIED:
+        return "The modified query will execute. Poll GET /execute/{run_id} for results."
+    elif info.status == InterruptStatus.CLARIFIED:
+        return "The agent will proceed with your clarification."
+    return "Resolution recorded."
 
 
 # ── Helpers ──────────────────────────────────────────────────────
