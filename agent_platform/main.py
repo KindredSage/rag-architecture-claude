@@ -55,18 +55,22 @@ async def lifespan(app: FastAPI):
     app.state.master_graph = build_master_graph(settings=settings, services=services)
     logger.info("Master graph compiled")
 
-    cleanup = asyncio.create_task(
-        _session_cleanup_loop(services["session_manager"], settings)
-    )
+    if services.get("session_manager"):
+        cleanup = asyncio.create_task(
+            _session_cleanup_loop(services["session_manager"], settings)
+        )
+    else:
+        cleanup = None
     logger.info("Startup complete")
 
     yield
 
-    cleanup.cancel()
-    try:
-        await cleanup
-    except asyncio.CancelledError:
-        pass
+    if cleanup:
+        cleanup.cancel()
+        try:
+            await cleanup
+        except asyncio.CancelledError:
+            pass
     await _shutdown_services(services)
     logger.info("Shutdown complete")
 
@@ -132,10 +136,14 @@ def _register_agents():
 
 
 async def _shutdown_services(services: dict[str, Any]):
-    await services["mcp"].shutdown()
-    await services["cache"].shutdown()
-    await services["session_manager"].shutdown()
-    services["clickhouse"].close()
+    if services.get("mcp"):
+        await services["mcp"].shutdown()
+    if services.get("cache"):
+        await services["cache"].shutdown()
+    if services.get("session_manager"):
+        await services["session_manager"].shutdown()
+    if services.get("clickhouse"):
+        services["clickhouse"].close()
 
 
 async def _session_cleanup_loop(sm, settings: Settings):
