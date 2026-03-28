@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 
 from agents.trade.state import TradeAgentState
 
@@ -61,7 +62,7 @@ Parsed Intent: {json.dumps(state.get('parsed_intent', {}), default=str)}
 Trade Context: {json.dumps(state.get('trade_context', {}), default=str)}"""
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ])

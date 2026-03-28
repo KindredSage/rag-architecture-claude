@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 
 from agents.trade.state import TradeAgentState
 
@@ -72,7 +73,7 @@ Conversation History (use this to resolve references like "it", "those", "the sa
 {history_text if history_text else "(no prior conversation)"}"""
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ])

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 
 from agents.trade.state import TradeAgentState
 
@@ -110,7 +111,7 @@ SQL Used: {state.get('generated_sql', 'N/A')}
 Desired Output: {desired_output}"""
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content=ANALYSIS_PROMPT),
             HumanMessage(content=prompt),
         ])

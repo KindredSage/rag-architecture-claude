@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 from langgraph.graph import END, START, StateGraph
 
 from agents.registry import AgentRegistry
@@ -44,7 +45,7 @@ async def trend_analyzer(state: AnalyticsState, *, ch_service, llm) -> dict:
 
     # Generate analytical query
     try:
-        sql_response = await llm.ainvoke([
+        sql_response = await invoke_llm(llm, [
             SystemMessage(content=(
                 "You are a ClickHouse analytics expert. Generate a query to analyze trends. "
                 "Include time-series grouping, running averages, or percent changes where applicable. "
@@ -119,7 +120,7 @@ Return ONLY valid JSON:
 }}"""
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content="You are a data analyst. Return ONLY valid JSON."),
             HumanMessage(content=prompt),
         ])

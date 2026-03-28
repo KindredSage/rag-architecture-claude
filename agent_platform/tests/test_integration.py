@@ -24,6 +24,7 @@ def clean_registry():
 def _make_mock_llm_response(content: str):
     m = MagicMock()
     m.content = content
+    m.response_metadata = {"finish_reason": "stop"}
     return m
 
 

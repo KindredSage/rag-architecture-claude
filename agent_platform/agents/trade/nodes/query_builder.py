@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 
 from agents.trade.state import TradeAgentState
 
@@ -72,7 +73,7 @@ async def query_builder(state: TradeAgentState, *, llm, settings) -> dict:
     )
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content=system),
             HumanMessage(content="\n\n".join(context_parts)),
         ])

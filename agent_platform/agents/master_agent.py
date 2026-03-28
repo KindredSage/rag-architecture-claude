@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 from langgraph.graph import END, START, StateGraph
 
 from agents.registry import AgentRegistry
@@ -172,7 +173,7 @@ async def classify_intent(state: MasterState, *, llm, **kwargs) -> dict:
     )
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content="You are a precise JSON-only intent classifier."),
             HumanMessage(content=prompt),
         ])
@@ -278,7 +279,7 @@ async def select_agents(state: MasterState, *, llm, **kwargs) -> dict:
     )
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content="You are a precise JSON-only agent router."),
             HumanMessage(content=prompt),
         ])
@@ -563,7 +564,7 @@ async def merge_results(state: MasterState, *, llm, **kwargs) -> dict:
     )
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content="You are a senior analyst. Return ONLY valid JSON."),
             HumanMessage(content=prompt),
         ])

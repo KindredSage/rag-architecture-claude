@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 from langgraph.graph import END, START, StateGraph
 
 from agents.registry import AgentRegistry
@@ -74,7 +75,7 @@ Return ONLY valid JSON:
 }}"""
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content="You are a report planner. Return ONLY valid JSON."),
             HumanMessage(content=prompt),
         ])
@@ -123,7 +124,7 @@ async def data_fetcher(state: ReportingState, *, ch_service, llm) -> dict:
             continue
 
         try:
-            sql_response = await llm.ainvoke([
+            sql_response = await invoke_llm(llm, [
                 SystemMessage(content=(
                     "You are a ClickHouse SQL expert. Generate a SELECT query. "
                     "Return ONLY the raw SQL, no explanation, no markdown fences. "
@@ -183,7 +184,7 @@ async def document_builder(
 
         # Generate narrative
         try:
-            narr_response = await llm.ainvoke([
+            narr_response = await invoke_llm(llm, [
                 SystemMessage(content="Summarize this data section in 2-3 sentences. Be concise and analytical."),
                 HumanMessage(content=f"Section: {heading}\nData ({len(rows)} rows): {json.dumps(rows[:10], default=str)}"),
             ])

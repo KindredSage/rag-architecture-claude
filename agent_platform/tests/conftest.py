@@ -54,6 +54,7 @@ def mock_llm_response():
     def _make(content: str):
         mock = MagicMock()
         mock.content = content
+        mock.response_metadata = {"finish_reason": "stop"}
         return mock
     return _make
 

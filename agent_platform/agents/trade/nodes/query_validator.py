@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from services.llm_invoke import invoke_llm
 
 from agents.trade.state import TradeAgentState
 
@@ -180,7 +181,7 @@ async def query_validator(state: TradeAgentState, *, llm, settings) -> dict:
     )
 
     try:
-        response = await llm.ainvoke([
+        response = await invoke_llm(llm, [
             SystemMessage(content="You are a SQL validator. Return ONLY valid JSON."),
             HumanMessage(content=prompt),
         ])
