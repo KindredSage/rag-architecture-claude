@@ -73,6 +73,11 @@ class AgentRegistry:
         return agent_id in cls._agents
 
     @classmethod
+    def has_enabled_agent(cls, agent_id: str) -> bool:
+        entry = cls._agents.get(agent_id)
+        return entry is not None and entry[0].enabled
+
+    @classmethod
     def get_routing_context(cls) -> str:
         """
         Build a structured text block describing all agents.
