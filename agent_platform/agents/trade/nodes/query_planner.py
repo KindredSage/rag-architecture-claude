@@ -57,9 +57,15 @@ Return ONLY a valid JSON object:
 async def query_planner(state: TradeAgentState, *, llm) -> dict:
     start = time.perf_counter()
 
+    schema_info = state.get("schema_info", {})
+    schema_text = schema_info.get("schema_text", "Schema not available")
+
     prompt = f"""User Query: {state['user_query']}
 Parsed Intent: {json.dumps(state.get('parsed_intent', {}), default=str)}
-Trade Context: {json.dumps(state.get('trade_context', {}), default=str)}"""
+Trade Context: {json.dumps(state.get('trade_context', {}), default=str)}
+
+=== ACTUAL TABLE SCHEMA (use real partition keys, sorting keys, engine type) ===
+{schema_text}"""
 
     try:
         response = await invoke_llm(llm, [

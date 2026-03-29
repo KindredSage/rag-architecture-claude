@@ -16,8 +16,8 @@ from agents.trade.state import TradeAgentState
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a trade domain expert. Given a user query about trading data,
-provide domain context that will help downstream agents build the right SQL query.
+SYSTEM_PROMPT = """You are a trade domain expert. You are given the ACTUAL schema and sample data
+from ClickHouse. Use REAL column names from the schema below. Do NOT guess or invent column names.
 
 IMPORTANT: The user may refer to entities, systems, or concepts from previous messages
 in the conversation. Use the conversation history to resolve pronouns ("it", "them"),
@@ -25,23 +25,29 @@ references ("the same", "those"), and implicit subjects. For example, if the use
 previously asked about "System A" and now asks "What are the downstreams?", you should
 understand they mean "downstreams of System A".
 
-Determine:
+=== ACTUAL TABLE SCHEMA ===
+{schema_text}
+
+=== SAMPLE DATA ===
+{sample_rows_text}
+
+Using this real schema and sample data, determine:
 - Asset class (equities, FX, fixed income, derivatives, commodities, crypto, mixed)
 - Trade lifecycle stage (pre-trade, execution, post-trade, settlement, all)
-- Relevant metrics (PnL, volume, VWAP, slippage, fill_rate, notional, spread, etc.)
+- Relevant metrics — map user concepts to ACTUAL column names from the schema
 - Time granularity needed (tick, minute, hourly, daily, monthly, yearly)
+- Column mappings: for every user term/concept, map it to the real column name(s)
 - Any regulatory or compliance context
-- Suggested table names based on domain knowledge
 - Resolved references from conversation context
 
 Return ONLY a valid JSON object:
 {{
   "asset_class": "<asset class>",
   "lifecycle_stage": "<stage>",
-  "relevant_metrics": ["<metric1>", "<metric2>"],
+  "relevant_metrics": ["<real_column_name1>", "<real_column_name2>"],
   "time_granularity": "<granularity>",
   "domain_notes": "<any relevant domain context>",
-  "suggested_tables": ["<table1>", "<table2>"],
+  "column_mappings": {{"<user term>": "<real_column_name>", "<user concept>": "<real_column_name>"}},
   "special_considerations": "<e.g., need FINAL for dedup, timezone handling, etc.>",
   "resolved_query": "<the user query with all references resolved from context>"
 }}"""
@@ -66,6 +72,16 @@ async def trade_analyst(state: TradeAgentState, *, llm) -> dict:
             history_lines.append(f"  {role}: {text[:200]}")
         history_text = "\n".join(history_lines)
 
+    # Inject real schema into the system prompt
+    schema_info = state.get("schema_info", {})
+    schema_text = schema_info.get("schema_text", "Schema not available")
+    sample_rows_text = schema_info.get("sample_rows_text", "No sample data")
+
+    system_prompt = SYSTEM_PROMPT.format(
+        schema_text=schema_text,
+        sample_rows_text=sample_rows_text,
+    )
+
     prompt = f"""User Query: {state['user_query']}
 Intent Analysis: {json.dumps(state.get('intent_analysis', {}), default=str)}
 
@@ -74,7 +90,7 @@ Conversation History (use this to resolve references like "it", "those", "the sa
 
     try:
         response = await invoke_llm(llm, [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=prompt),
         ])
 
@@ -105,7 +121,7 @@ Conversation History (use this to resolve references like "it", "those", "the sa
         duration = (time.perf_counter() - start) * 1000
         logger.error("Trade analyst failed: %s", e)
         return {
-            "trade_context": {"asset_class": "unknown", "relevant_metrics": [], "suggested_tables": []},
+            "trade_context": {"asset_class": "unknown", "relevant_metrics": [], "column_mappings": {}},
             "execution_trace": [{
                 "node": "trade_analyst",
                 "status": "error",

@@ -366,3 +366,128 @@ async def clarification_gate(
         result["user_query"] = f"{state.get('user_query', '')} [Clarification: {answer}]"
 
     return result
+
+
+async def failure_feedback_gate(
+    state: dict,
+    *,
+    hitl_service: HITLService,
+    run_id: str,
+    session_id: str,
+    agent_id: str = "trade_agent",
+    blocking: bool = True,
+    timeout: int = 600,
+) -> dict:
+    """
+    Gate when query retries are exhausted. Asks the user what they expected,
+    then routes back to query_analyst for a full re-assessment.
+    """
+    start = time.perf_counter()
+    config = HITLConfig(**state.get("hitl_config", {}))
+
+    if not config.enabled:
+        return {
+            "hitl_skipped": True,
+            "execution_trace": [{
+                "node": "failure_feedback_gate",
+                "status": "skipped",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "output_summary": "HITL disabled; cannot ask user for feedback",
+            }],
+        }
+
+    retry_feedback = state.get("retry_feedback", "Unknown error")
+    generated_sql = state.get("generated_sql", "")
+    validation_issues = state.get("validation_result", {}).get("issues", [])
+
+    interrupt = InterruptRequest(
+        run_id=run_id,
+        session_id=session_id,
+        interrupt_type=InterruptType.CLARIFICATION,
+        node_name="failure_feedback_gate",
+        agent_id=agent_id,
+        title="Query Failed - Help Us Understand What You Need",
+        description=(
+            f"We tried {state.get('retry_count', 0)} times but could not build a valid query. "
+            f"Last error: {retry_feedback}. "
+            "Could you describe what result you expected?"
+        ),
+        payload={
+            "question": "What result did you expect? Please describe the columns, filters, or format you need.",
+            "failed_sql": generated_sql,
+            "errors": [i.get("message", "") for i in validation_issues if i.get("severity") == "error"],
+            "retry_count": state.get("retry_count", 0),
+            "original_query": state.get("user_query", ""),
+        },
+        auto_approve_seconds=None,
+    )
+
+    info = await hitl_service.create_interrupt(interrupt)
+
+    if not blocking:
+        return {
+            "hitl_pending": {
+                "interrupt_id": info.interrupt_id,
+                "type": InterruptType.CLARIFICATION.value,
+                "status": "pending",
+            },
+            "execution_trace": [{
+                "node": "failure_feedback_gate",
+                "status": "waiting_human",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "output_summary": f"Waiting for user feedback (interrupt={info.interrupt_id})",
+            }],
+        }
+
+    resolved = await hitl_service.wait_for_resolution(info.interrupt_id, timeout=timeout)
+    duration = (time.perf_counter() - start) * 1000
+
+    if not resolved or resolved.status == InterruptStatus.EXPIRED:
+        return {
+            "hitl_response": {"action": "expired"},
+            "error": "Feedback request timed out. Query could not be completed.",
+            "execution_trace": [{
+                "node": "failure_feedback_gate",
+                "status": "expired",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "duration_ms": round(duration, 1),
+            }],
+        }
+
+    if resolved.status == InterruptStatus.REJECTED:
+        return {
+            "hitl_response": {"action": "rejected"},
+            "error": "User chose not to provide feedback.",
+            "execution_trace": [{
+                "node": "failure_feedback_gate",
+                "status": "rejected",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "duration_ms": round(duration, 1),
+            }],
+        }
+
+    # User provided feedback -- merge into state for query_analyst re-run
+    answer = ""
+    if resolved.resolution:
+        answer = resolved.resolution.get("modifications", {}).get("answer", "")
+
+    result: dict[str, Any] = {
+        "hitl_response": {"action": "clarified", "answer": answer},
+        "needs_retry": False,
+        "retry_count": 0,
+        "retry_feedback": "",
+        "generated_sql": "",
+        "validation_result": {},
+        "execution_trace": [{
+            "node": "failure_feedback_gate",
+            "status": "clarified",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": round(duration, 1),
+            "output_summary": f"User feedback: {answer[:100]}",
+        }],
+    }
+
+    if answer:
+        result["user_query"] = f"{state.get('user_query', '')} [User clarification: {answer}]"
+
+    return result

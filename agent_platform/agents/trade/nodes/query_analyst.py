@@ -21,34 +21,49 @@ from agents.trade.state import TradeAgentState
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a query intent analyst for a ClickHouse-backed trading platform.
-Using the user query, trade domain context, and conversation history, produce a precise
-structured breakdown of what data to fetch.
+Using the user query, trade domain context, ACTUAL schema, and conversation history, produce
+a precise structured breakdown of what data to fetch.
+
+CRITICAL: Use ACTUAL column names from the schema below. Do NOT guess or invent column names.
+Map user terms to real columns using the column_mappings from trade context.
+
+=== ACTUAL TABLE SCHEMA ===
+{schema_text}
+
+=== SAMPLE DATA ===
+{sample_rows_text}
+
+=== COLUMN MAPPINGS (from trade analyst) ===
+{column_mappings}
 
 IMPORTANT: The trade context may contain a "resolved_query" field where pronouns and
 references from conversation history have already been resolved. Use that as your primary
-intent source. For example, if the user says "What are the downstreams?" and resolved_query
-says "What are the downstreams of System A?", use the resolved version.
+intent source.
+
+Verify filter values against the sample data where possible. If a user mentions a value
+(e.g., a ticker, desk name, or status) that you can confirm exists in the sample data,
+mark it as verified. If you cannot confirm it, mark it as unverified.
 
 Return ONLY a valid JSON object:
 {{
   "operation": "<SELECT|AGGREGATE|JOIN|WINDOW|PIVOT|DESCRIBE>",
-  "target_entities": ["<table or column guesses based on domain context>"],
+  "target_entities": ["<REAL table/column names from schema>"],
   "filters": [
-    {{"field": "<column>", "op": "<= | >= | != | = | IN | BETWEEN | LIKE>", "value": "<value>"}}
+    {{"field": "<REAL column name>", "op": "<= | >= | != | = | IN | BETWEEN | LIKE>", "value": "<value>"}}
   ],
   "aggregations": [
-    {{"function": "<SUM|AVG|COUNT|MIN|MAX|quantile|uniq|argMax>", "field": "<column>", "alias": "<n>"}}
+    {{"function": "<SUM|AVG|COUNT|MIN|MAX|quantile|uniq|argMax>", "field": "<REAL column name>", "alias": "<n>"}}
   ],
-  "group_by": ["<column1>", "<column2>"],
-  "order_by": [{{"field": "<column>", "direction": "<ASC|DESC>"}}],
+  "group_by": ["<REAL column name>"],
+  "order_by": [{{"field": "<REAL column name>", "direction": "<ASC|DESC>"}}],
   "limit": <int or null>,
   "time_range": {{"start": "<date or relative>", "end": "<date or relative>"}},
   "output_format": "<table|scalar|time_series|distribution|ranking>",
   "needs_join": <true|false>,
-  "join_hint": "<if join needed, describe which tables and keys>"
-}}
-
-Be specific about column names where you can infer them from domain context."""
+  "join_hint": "<if join needed, describe which tables and keys>",
+  "verified_values": ["<values confirmed in sample data>"],
+  "unverified_values": ["<values NOT found in sample data — handle with caution>"]
+}}"""
 
 
 async def query_analyst(state: TradeAgentState, *, llm) -> dict:
@@ -56,6 +71,18 @@ async def query_analyst(state: TradeAgentState, *, llm) -> dict:
 
     trade_ctx = state.get("trade_context", {})
     resolved = trade_ctx.get("resolved_query", state["user_query"])
+
+    # Inject real schema into system prompt
+    schema_info = state.get("schema_info", {})
+    schema_text = schema_info.get("schema_text", "Schema not available")
+    sample_rows_text = schema_info.get("sample_rows_text", "No sample data")
+    column_mappings = json.dumps(trade_ctx.get("column_mappings", {}), indent=2)
+
+    system_prompt = SYSTEM_PROMPT.format(
+        schema_text=schema_text,
+        sample_rows_text=sample_rows_text,
+        column_mappings=column_mappings,
+    )
 
     # Build conversation history for context
     history = state.get("conversation_history", [])
@@ -82,7 +109,7 @@ Conversation History:
 
     try:
         response = await invoke_llm(llm, [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=prompt),
         ])
 

@@ -260,6 +260,63 @@ class ClickHouseService:
         )
         return result["data"] if result["success"] else []
 
+    def get_targeted_schema_context(
+        self,
+        table_name: str,
+        database: str | None = None,
+        sample_limit: int = 5,
+    ) -> dict[str, Any]:
+        """
+        Fetch schema + sample rows for a single specific table.
+        Used by trade agent to get ground-truth schema before any LLM reasoning.
+        """
+        db = database or self.settings.ch_database
+        if db not in self.settings.allowed_ch_databases:
+            return {"database": db, "tables": {}, "error": f"Database {db} not in allowed list"}
+
+        tables_result = self.execute_query(
+            """
+            SELECT
+                database, name, engine, partition_key, sorting_key,
+                total_rows, total_bytes,
+                formatReadableSize(total_bytes) as readable_size
+            FROM system.tables
+            WHERE database = {db:String} AND name = {tbl:String}
+            LIMIT 1
+            """,
+            parameters={"db": db, "tbl": table_name},
+        )
+
+        if not tables_result["success"] or not tables_result["data"]:
+            return {"database": db, "tables": {}, "error": f"Table {db}.{table_name} not found"}
+
+        tbl_meta = tables_result["data"][0]
+        columns = self.get_columns(table_name, db)
+        sample_rows = self.get_table_sample(table_name, limit=sample_limit, database=db)
+
+        schema = {
+            table_name: {
+                "engine": tbl_meta.get("engine", ""),
+                "partition_key": tbl_meta.get("partition_key", ""),
+                "sorting_key": tbl_meta.get("sorting_key", ""),
+                "total_rows": tbl_meta.get("total_rows", 0),
+                "readable_size": tbl_meta.get("readable_size", ""),
+                "columns": [
+                    {
+                        "name": c["name"],
+                        "type": c["type"],
+                        "comment": c.get("comment", ""),
+                        "is_partition_key": c.get("is_in_partition_key", 0) == 1,
+                        "is_sorting_key": c.get("is_in_sorting_key", 0) == 1,
+                    }
+                    for c in columns
+                ],
+                "sample_rows": sample_rows,
+            }
+        }
+
+        return {"database": db, "tables": schema}
+
     def explain_query(self, sql: str) -> str:
         result = self.execute_query(f"EXPLAIN {sql}")
         if result["success"] and result["data"]:

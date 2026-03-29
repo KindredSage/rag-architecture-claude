@@ -75,9 +75,10 @@ async def execute_query(
 
         timing_ms = (time.monotonic() - start) * 1000
         final = result.get("final_response", {})
+        result_status = result.get("status")
         error = result.get("error")
 
-        if error == "waiting_human":
+        if result_status == "waiting_human":
             status = RunStatus.WAITING_HUMAN
             error = None
         elif error:

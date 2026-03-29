@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     ch_host: str = "localhost"
     ch_port: int = 8123
     ch_native_port: int = 9000
-    ch_database: str = "trading_db"
+    ch_database: str = "odin"
     ch_user: str = "default"
     ch_password: SecretStr = SecretStr("")
     ch_secure: bool = False
@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     # ── Security ─────────────────────────────────────────────────
     api_key: SecretStr = SecretStr("")  # empty = no auth
     allowed_ch_databases: list[str] = Field(
-        default_factory=lambda: ["trading_db"]
+        default_factory=lambda: ["odin", "trading_db"]
     )
     sql_blocked_keywords: list[str] = Field(
         default_factory=lambda: [

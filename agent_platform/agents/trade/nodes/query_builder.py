@@ -50,14 +50,28 @@ async def query_builder(state: TradeAgentState, *, llm, settings) -> dict:
     is_retry = state.get("needs_retry", False)
     retry_count = state.get("retry_count", 0)
 
-    schema_text = state.get("schema_info", {}).get("schema_text", "No schema available")
+    schema_info = state.get("schema_info", {})
+    schema_text = schema_info.get("schema_text", "No schema available")
+    sample_rows_text = schema_info.get("sample_rows_text", "No sample data")
+    trade_ctx = state.get("trade_context", {})
+    column_mappings = trade_ctx.get("column_mappings", {})
+    parsed_intent = state.get("parsed_intent", {})
+    unverified_values = parsed_intent.get("unverified_values", [])
 
     context_parts = [
         f"User Query: {state['user_query']}",
-        f"Parsed Intent: {json.dumps(state.get('parsed_intent', {}), default=str)}",
+        f"Parsed Intent: {json.dumps(parsed_intent, default=str)}",
         f"Query Plan: {json.dumps(state.get('query_plan', {}), default=str)}",
         f"\nSchema:\n{schema_text}",
+        f"\nSample Data (use to verify filter values):\n{sample_rows_text}",
+        f"\nColumn Mappings (user term -> real column):\n{json.dumps(column_mappings, indent=2)}",
     ]
+
+    if unverified_values:
+        context_parts.append(
+            f"\n⚠ UNVERIFIED VALUES (not confirmed in sample data, use with caution):\n"
+            f"{json.dumps(unverified_values)}"
+        )
 
     if is_retry:
         feedback = state.get("retry_feedback", "Unknown error")
