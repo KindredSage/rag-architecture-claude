@@ -53,10 +53,11 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Optional
 
 logging.basicConfig(
@@ -429,14 +430,14 @@ def _recommend_column(client, db, table, col_name, col_type, sample_pct):
                     min(toFloat64OrNull(toString(`{col_name}`)))  AS mn,
                     max(toFloat64OrNull(toString(`{col_name}`)))  AS mx,
                     max(CASE
-                        WHEN position('.', toString(`{col_name}`)) > 0
+                        WHEN position('.', ifNull(toString(`{col_name}`), '')) > 0
                              AND toFloat64OrNull(toString(`{col_name}`))
                                  != floor(toFloat64OrNull(toString(`{col_name}`)))
                         THEN 1 ELSE 0
                     END) AS has_frac,
                     maxIf(
-                        length(splitByChar('.', toString(`{col_name}`))[2]),
-                        position('.', toString(`{col_name}`)) > 0
+                        length(splitByChar('.', ifNull(toString(`{col_name}`), ''))[2]),
+                        position('.', ifNull(toString(`{col_name}`), '')) > 0
                     ) AS max_scale,
                     round(countIf(`{col_name}` IS NULL) * 100.0 / count(), 2) AS null_pct,
                     uniqHLL12(`{col_name}`) AS ndist
@@ -578,31 +579,38 @@ ENGINE = Distributed('{topo.cluster}', '{topo.database}', '{topo.local_table}', 
 # ═══════════════════════════════════════════════════════════════════════════
 # Cast expression builder
 # ═══════════════════════════════════════════════════════════════════════════
+def column_cast_expr(c: ColumnRec) -> str:
+    """Bare cast expression for one column (no `AS name` suffix)."""
+    if not c.changed:
+        return f"`{c.name}`"
+
+    target = c.recommended_type
+    inner = target
+    lc_wrap = nullable_wrap = False
+
+    if inner.startswith("LowCardinality("):
+        lc_wrap = True
+        inner = inner[len("LowCardinality("):-1]
+    if inner.startswith("Nullable("):
+        nullable_wrap = True
+        inner = inner[len("Nullable("):-1]
+
+    expr = _cast_expr(c.name, inner, c.current_type)
+    if nullable_wrap:
+        expr = f"toNullable({expr})"
+    if lc_wrap:
+        expr = f"toLowCardinality({expr})"
+    return expr
+
+
 def generate_cast_select(columns: list[ColumnRec]) -> str:
     parts = []
     for c in columns:
-        if not c.changed:
-            parts.append(f"    `{c.name}`")
-            continue
-
-        target = c.recommended_type
-        inner = target
-        lc_wrap = nullable_wrap = False
-
-        if inner.startswith("LowCardinality("):
-            lc_wrap = True
-            inner = inner[len("LowCardinality("):-1]
-        if inner.startswith("Nullable("):
-            nullable_wrap = True
-            inner = inner[len("Nullable("):-1]
-
-        expr = _cast_expr(c.name, inner, c.current_type)
-        if nullable_wrap:
-            expr = f"toNullable({expr})"
-        if lc_wrap:
-            expr = f"toLowCardinality({expr})"
-        parts.append(f"    {expr} AS `{c.name}`")
-
+        expr = column_cast_expr(c)
+        if c.changed:
+            parts.append(f"    {expr} AS `{c.name}`")
+        else:
+            parts.append(f"    {expr}")
     return ",\n".join(parts)
 
 
@@ -1024,6 +1032,188 @@ def migrate_dim(client, topo: TableTopology, dry_run: bool, pause: int,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ALTER fast-path (no rebuild — used when no ORDER BY / PARTITION BY columns
+# need to change, or when --skip-key tells us to leave key columns as-is)
+# ═══════════════════════════════════════════════════════════════════════════
+def wait_for_mutations(client, topo: TableTopology, timeout: int = 7200) -> bool:
+    """Poll system.mutations across all replicas until is_done=1 everywhere."""
+    db = topo.database
+    table = topo.local_table
+    start = time.time()
+    last_parts = None
+
+    while time.time() - start < timeout:
+        try:
+            rows = q(client, f"""
+                SELECT
+                    countIf(is_done = 0) AS pending,
+                    sumIf(parts_to_do, is_done = 0) AS parts_left
+                FROM clusterAllReplicas('{topo.cluster}', system.mutations)
+                WHERE database = '{db}' AND table = '{table}'
+            """)
+            pending = rows[0]["pending"] if rows else 0
+            parts_left = rows[0]["parts_left"] if rows else 0
+
+            if pending == 0:
+                logger.info(f"  ✓ All mutations complete "
+                            f"(took {time.time()-start:.0f}s)")
+                return True
+
+            if parts_left != last_parts:
+                logger.info(f"  {pending} mutation(s) pending, "
+                            f"{parts_left} parts remaining")
+                last_parts = parts_left
+            time.sleep(15)
+        except Exception as e:
+            logger.warning(f"  Mutation check error: {e}, retrying...")
+            time.sleep(15)
+
+    logger.error(f"  ⚠ Mutations not complete after {timeout}s")
+    return False
+
+
+def migrate_via_alter(client, topo: TableTopology, dry_run: bool,
+                      skip_key: bool, mutation_timeout: int = 7200) -> bool:
+    """
+    Apply column changes via ALTER TABLE ... MODIFY COLUMN.
+
+    Use when no ORDER BY / PARTITION BY columns need changing, OR when
+    --skip-key tells us to leave key cols as-is. Avoids the full rebuild —
+    only the changed columns' data parts are rewritten via mutation.
+
+    Flow:
+      1. ALTER local ON CLUSTER (one statement, multiple MODIFY COLUMN clauses)
+      2. Poll system.mutations until done on every replica
+      3. ALTER the Distributed table (metadata-only) so its schema stays in sync
+    """
+    db = topo.database
+
+    targets = []
+    skipped_keys = []
+    for c in topo.columns:
+        if not c.changed:
+            continue
+        if c.is_in_order_by or c.is_in_partition_by:
+            if skip_key:
+                skipped_keys.append(c)
+                continue
+            logger.error(
+                f"  ✗ Cannot ALTER key column `{c.name}` "
+                f"(in ORDER BY / PARTITION BY). Use rebuild path or --skip-key.")
+            return False
+        targets.append(c)
+
+    if skipped_keys:
+        logger.info(f"  --skip-key: leaving {len(skipped_keys)} key column(s) "
+                    f"unchanged: {', '.join(c.name for c in skipped_keys)}")
+
+    if not targets:
+        logger.info("  Nothing to ALTER.")
+        return True
+
+    modify_clauses = ",\n    ".join(
+        f"MODIFY COLUMN `{c.name}` {c.recommended_type} {c.codec}"
+        for c in targets
+    )
+
+    # 1. ALTER local
+    _step(1, f"ALTER {len(targets)} column(s) on {topo.local_table}")
+    for c in targets:
+        logger.info(f"    {c.name}: {c.current_type} → {c.recommended_type}")
+    alter_local = (f"ALTER TABLE `{db}`.`{topo.local_table}` "
+                   f"ON CLUSTER `{topo.cluster}`\n    {modify_clauses}")
+    _run_or_log(client, alter_local, dry_run)
+
+    # 2. Wait for mutations to settle on every replica
+    if not dry_run:
+        _step(2, "Wait for column mutations to complete")
+        if not wait_for_mutations(client, topo, timeout=mutation_timeout):
+            logger.error("  ⚠ Continuing despite mutation timeout — verify manually")
+
+    # 3. ALTER distributed (metadata only, instant)
+    if topo.distributed_table:
+        _step(3, f"ALTER {topo.distributed_table} (metadata sync)")
+        alter_dist = (f"ALTER TABLE `{db}`.`{topo.distributed_table}` "
+                      f"ON CLUSTER `{topo.cluster}`\n    {modify_clauses}")
+        _run_or_log(client, alter_dist, dry_run)
+
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Loader SQL emission (so the ETL's INSERT FROM s3() does explicit casts
+# instead of relying on implicit conversion, which fails on Decimal→Int,
+# scale mismatches, sentinel dates, etc.)
+# ═══════════════════════════════════════════════════════════════════════════
+def emit_loader_sql(topo: TableTopology, out_dir: str,
+                    strategy: str, skip_key: bool, dry_run: bool) -> None:
+    """
+    Write `{out_dir}/{target_table}.sql` containing an
+    `INSERT INTO ... SELECT <casts> FROM s3('S3_PATH_HERE', 'Parquet')` template.
+    The cast list reflects the table's *actual* post-migration schema, so
+    `--skip-key` columns (which were not altered) are left as bare references.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Build effective column list: key cols left untouched by --skip-key
+    # were NOT actually altered, so their loader cast should be a passthrough.
+    effective = [
+        replace(c, changed=False)
+        if (strategy == "alter" and skip_key and c.changed
+            and (c.is_in_order_by or c.is_in_partition_by))
+        else c
+        for c in topo.columns
+    ]
+
+    cast_select = generate_cast_select(effective)
+    target_table = topo.distributed_table or topo.local_table
+    path = os.path.join(out_dir, f"{target_table}.sql")
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    note = "DRY RUN — preview only" if dry_run else "post-migration"
+    skip_tag = " --skip-key" if (skip_key and strategy == "alter") else ""
+
+    # Oracle UPDATE block — one row per column; placeholders XXXX and
+    # ##to_replace## are left for downstream substitution by the user's pipeline.
+    oracle_updates = []
+    for c in effective:
+        expr = column_cast_expr(c).replace("'", "''")   # escape for Oracle literal
+        oracle_updates.append(
+            f"UPDATE XXXX SET explicit_cast = '{expr}'"
+            f" WHERE key_col=##to_replace## AND column_name='{c.name}';"
+        )
+    oracle_block = "\n".join(oracle_updates)
+
+    content = f"""-- Loader cast SELECT for `{topo.database}`.`{target_table}`
+-- Generated {timestamp} by ch_lb_migrate.py ({note}, strategy={strategy}{skip_tag})
+--
+-- Drop this into the ETL so the INSERT does explicit casts from the Parquet
+-- (Decimal256-heavy) source onto the now-narrower CH column types. Replace
+-- 'S3_PATH_HERE' with your bucket path; add credentials/format settings as
+-- your existing ETL does.
+
+INSERT INTO `{topo.database}`.`{target_table}`
+SELECT
+{cast_select}
+FROM s3('S3_PATH_HERE', 'Parquet');
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Oracle metadata sync (run on Oracle, not ClickHouse).
+-- Replace XXXX with your metadata table name.
+-- Replace ##to_replace## with the key value identifying this CH table
+-- in that metadata table.
+-- Unchanged columns get a bare `col` reference so the metadata stays
+-- complete even for columns whose type was not narrowed.
+-- ─────────────────────────────────────────────────────────────────────────
+{oracle_block}
+"""
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    logger.info(f"  Loader SQL → {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Table discovery for --all-decimal256
 # ═══════════════════════════════════════════════════════════════════════════
 def find_decimal256_tables(client, db: str, table_type: str) -> list[str]:
@@ -1102,6 +1292,19 @@ Examples:
     parser.add_argument("--pause-between-partitions", type=int, default=10)
     parser.add_argument("--replication-timeout", type=int, default=600,
                         help="Max wait for dim ZK replication (default 600s)")
+    parser.add_argument("--skip-key", action="store_true",
+                        help="Take the ALTER fast-path even when ORDER BY / "
+                             "PARTITION BY cols would otherwise need changing. "
+                             "Key cols are left as-is; non-key cols are altered "
+                             "in place (no full table rebuild).")
+    parser.add_argument("--mutation-timeout", type=int, default=7200,
+                        help="Max wait (s) for ALTER mutations to settle on "
+                             "every replica in the alter fast-path (default 7200)")
+    parser.add_argument("--emit-loader-sql", default=None, metavar="DIR",
+                        help="Write per-table loader cast-SELECT .sql files to DIR. "
+                             "Each file is an INSERT INTO ... SELECT <explicit casts> "
+                             "FROM s3('S3_PATH_HERE','Parquet') template so the ETL "
+                             "avoids implicit-conversion errors on the narrowed types.")
     parser.add_argument("--output-report", default=None)
     args = parser.parse_args()
 
@@ -1184,8 +1387,36 @@ Examples:
             "columns": [asdict(c) for c in topo.columns],
         })
 
+        # Decide migration strategy: ALTER fast-path vs full rebuild
+        key_changes = [c for c in changes
+                       if c.is_in_order_by or c.is_in_partition_by]
+        non_key_changes = [c for c in changes
+                           if not (c.is_in_order_by or c.is_in_partition_by)]
+
+        if key_changes and not args.skip_key:
+            strategy = "rebuild"
+            logger.info(f"\n  {len(key_changes)} key column change(s) "
+                        f"→ full rebuild path")
+        elif key_changes and args.skip_key and not non_key_changes:
+            logger.info(f"\n  --skip-key: only key cols changed, "
+                        f"nothing to alter. Skipping.")
+            results.append((tbl, "SKIP", "skip-key, no non-key changes"))
+            continue
+        else:
+            strategy = "alter"
+            if key_changes:
+                logger.info(f"\n  --skip-key: skipping {len(key_changes)} key "
+                            f"col change(s); ALTER {len(non_key_changes)} "
+                            f"non-key col(s)")
+            else:
+                logger.info(f"\n  No key column changes → ALTER fast-path "
+                            f"({len(non_key_changes)} col(s))")
+
         # Migrate
-        if args.table_type == "fact":
+        if strategy == "alter":
+            ok = migrate_via_alter(client, topo, args.dry_run,
+                                   args.skip_key, args.mutation_timeout)
+        elif args.table_type == "fact":
             ok = migrate_fact(client, topo, args.dry_run,
                               args.pause_between_partitions)
         else:
@@ -1194,11 +1425,18 @@ Examples:
                              args.replication_timeout)
 
         if ok:
-            if not args.dry_run:
+            if not args.dry_run and strategy == "rebuild":
                 show_size_comparison(client, topo)
-            results.append((tbl, "OK" if not args.dry_run else "DRY RUN", ""))
+            if args.emit_loader_sql:
+                try:
+                    emit_loader_sql(topo, args.emit_loader_sql,
+                                    strategy, args.skip_key, args.dry_run)
+                except Exception as e:
+                    logger.warning(f"  Could not write loader SQL: {e}")
+            status = "OK" if not args.dry_run else "DRY RUN"
+            results.append((tbl, status, strategy))
         else:
-            results.append((tbl, "FAILED", "see logs"))
+            results.append((tbl, "FAILED", strategy))
             if not args.dry_run:
                 logger.error(f"Stopping on failure: {tbl}")
                 break
@@ -1212,10 +1450,12 @@ Examples:
         logger.info(f"  {status:<10} {tbl}{extra}")
 
     if not args.dry_run:
-        ok_tables = [tbl for tbl, s, _ in results if s == "OK"]
-        if ok_tables:
+        # Only rebuild-path tables leave a *_old behind
+        ok_rebuild = [tbl for tbl, s, note in results
+                      if s == "OK" and note == "rebuild"]
+        if ok_rebuild:
             logger.info(f"\n  Cleanup (after verification):")
-            for tbl in ok_tables:
+            for tbl in ok_rebuild:
                 _, local, _ = resolve_names(tbl, args.table_type)
                 logger.info(f"    DROP TABLE `{args.database}`.`{local}_old` "
                              f"ON CLUSTER `{args.cluster}`;")
