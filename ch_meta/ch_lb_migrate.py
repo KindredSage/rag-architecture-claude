@@ -76,6 +76,11 @@ try:
         return clickhouse_connect.get_client(
             host=host, port=port or 8123,
             username=user, password=password, database=database,
+            # ⚠ Behind a LB, consecutive requests can land on different nodes.
+            # clickhouse-connect uses persistent sessions by default, but the
+            # session UUID is node-local — a second node sees it as "locked".
+            # Setting session_id='' disables server-side sessions entirely.
+            session_id='',
         )
 
     def q(client, sql, settings=None):
@@ -371,6 +376,13 @@ def profile_columns(client, topo: TableTopology, sample_pct: float):
     topo.columns = columns
 
 
+def _sample_clause(sample_pct: float) -> str:
+    """Return 'SAMPLE 0.01' or '' if sampling is disabled."""
+    if sample_pct > 0:
+        return f"SAMPLE {sample_pct}"
+    return ""
+
+
 def _recommend_column(client, db, table, col_name, col_type, sample_pct):
     """Returns (recommended_type, codec, reason)."""
     base = col_type.replace("Nullable(", "").rstrip(")")
@@ -388,7 +400,7 @@ def _recommend_column(client, db, table, col_name, col_type, sample_pct):
                         OR toSecond(toDateTime64(`{col_name}`, 6)) != 0
                     ) AS has_time,
                     count() AS cnt
-                FROM `{db}`.`{table}` SAMPLE {sample_pct}
+                FROM `{db}`.`{table}` {_sample_clause(sample_pct)}
             """)
             r = rows[0]
             codec = "CODEC(DoubleDelta, ZSTD(1))"
@@ -428,7 +440,7 @@ def _recommend_column(client, db, table, col_name, col_type, sample_pct):
                     ) AS max_scale,
                     round(countIf(`{col_name}` IS NULL) * 100.0 / count(), 2) AS null_pct,
                     uniqHLL12(`{col_name}`) AS ndist
-                FROM `{db}`.`{table}` SAMPLE {sample_pct}
+                FROM `{db}`.`{table}` {_sample_clause(sample_pct)}
             """)
         except Exception as e:
             return col_type, "CODEC(ZSTD(1))", f"Sampling error: {e}"
@@ -484,7 +496,7 @@ def _recommend_column(client, db, table, col_name, col_type, sample_pct):
                     uniqHLL12(`{col_name}`) AS ndist,
                     min(length(toString(`{col_name}`))) AS min_len,
                     max(length(toString(`{col_name}`))) AS max_len
-                FROM `{db}`.`{table}` SAMPLE {sample_pct}
+                FROM `{db}`.`{table}` {_sample_clause(sample_pct)}
             """)
             r = rows[0]
             ndist = r["ndist"]
@@ -1083,12 +1095,19 @@ Examples:
     parser.add_argument("--all-decimal256", action="store_true")
     parser.add_argument("--sample-pct",    type=float, default=0.01,
                         help="Profiling sample (0.01 = 1%%)")
+    parser.add_argument("--no-sample",     action="store_true",
+                        help="Disable SAMPLE clause — scan full dataset for profiling "
+                             "(required if your CH engine/table doesn't support SAMPLE)")
     parser.add_argument("--dry-run",       action="store_true")
     parser.add_argument("--pause-between-partitions", type=int, default=10)
     parser.add_argument("--replication-timeout", type=int, default=600,
                         help="Max wait for dim ZK replication (default 600s)")
     parser.add_argument("--output-report", default=None)
     args = parser.parse_args()
+
+    # --no-sample overrides --sample-pct
+    if args.no_sample:
+        args.sample_pct = 0
 
     client = make_client(args.host, args.port, args.user, args.password,
                          args.database)
@@ -1138,7 +1157,8 @@ Examples:
             logger.info(f"  Replication: full copy on all 6 nodes")
 
         # Profile
-        logger.info(f"\n  Profiling ({args.sample_pct*100:.1f}% sample)...")
+        sample_msg = "full scan" if args.sample_pct == 0 else f"{args.sample_pct*100:.1f}% sample"
+        logger.info(f"\n  Profiling ({sample_msg})...")
         profile_columns(client, topo, args.sample_pct)
 
         changes = [c for c in topo.columns if c.changed]
